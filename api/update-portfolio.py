@@ -1,75 +1,70 @@
 # File: api/update-portfolio.py
-# 已改造为与 trigger.py 相同的 BaseHTTPRequestHandler 模式
+# This is a Vercel Serverless Function with CORRECT CORS handling
 
-import os
+from http.server import BaseHTTPRequestHandler
 import json
 import base64
 from github import Github, GithubException
+import os
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler
-
-# 从环境变量获取配置
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://digital-era.github.io")
 
 class handler(BaseHTTPRequestHandler):
 
-    def _send_response(self, status_code, data=None):
-        """统一发送响应的辅助函数"""
+    def _set_headers(self, status_code=200):
+        """
+        A centralized method to set all required response headers, including CORS.
+        """
         self.send_response(status_code)
         self.send_header('Content-type', 'application/json')
-        # --- 添加 CORS 头部 ---
-        self.send_header('Access-Control-Allow-Origin', ALLOWED_ORIGIN)
+        
+        # --- CORS Headers ---
+        # It's crucial to handle the Origin header dynamically and securely.
+        # This setup allows requests from your specified frontend origins.
+        allowed_origins = os.environ.get(
+            'ALLOWED_ORIGIN', 
+            "https://digital-era.github.io,http://127.0.0.1:5500,http://localhost:5500"
+        ).split(',')
+        
+        origin = self.headers.get('Origin')
+        if origin in allowed_origins:
+            self.send_header('Access-Control-Allow-Origin', origin)
+        
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
-        
-        if data:
-            self.wfile.write(json.dumps(data).encode('utf-8'))
 
     def do_OPTIONS(self):
-        """处理 CORS 预检请求"""
-        self.send_response(204) # 204 No Content for preflight
-        self.send_header('Access-Control-Allow-Origin', ALLOWED_ORIGIN)
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
+        """
+        Handles CORS preflight requests sent by the browser before a POST request.
+        """
+        self._set_headers(204) # 204 No Content is the standard response for preflight requests.
 
     def do_POST(self):
-        """处理 POST 请求"""
         try:
-            # 1. 解析请求体
-            content_length = int(self.headers.get('Content-Length', 0))
-            if content_length == 0:
-                self._send_response(400, {"error": "请求体为空"})
-                return
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            body = json.loads(post_data)
 
-            post_data_raw = self.rfile.read(content_length)
-            body = json.loads(post_data_raw)
+            if 'portfolioData' not in body:
+                raise ValueError("Missing 'portfolioData' in request body")
             
-            if "portfolioData" not in body:
-                self._send_response(400, {"error": "请求体中缺少 'portfolioData'"})
-                return
-
-            excel_b64_string = body["portfolioData"]
+            excel_b64_string = body['portfolioData']
             excel_content = base64.b64decode(excel_b64_string)
 
-            # 2. 配置 GitHub 访问
-            github_token = os.environ.get("GITHUB_TOKEN")
-            repo_owner = os.environ.get("GITHUB_REPO_OWNER")
-            repo_pro = os.environ.get("GITHUB_REPO_NAME")
-
-            if not all([github_token, repo_owner, repo_pro]):
-                self._send_response(500, {"error": "服务器配置不完整。缺少必需的 GitHub 环境变量。"})
-                return
-
+            github_token = os.environ.get('GITHUB_TOKEN')
+            repo_owner = os.environ.get('GITHUB_REPO_OWNER')
+            repo_pro = os.environ.get('GITHUB_REPO_NAME')
             repo_name = f"{repo_owner}/{repo_pro}"
+            
+            if not github_token:
+                raise ConnectionError("GITHUB_TOKEN environment variable is not set.")
+
             g = Github(github_token)
             repo = g.get_repo(repo_name)
-
-            # 3. 提交文件到 GitHub
-            file_path = "data/AIPEPortfolio_new.xlsx"
-            commit_message = f"chore: 通过 Web UI 更新投资组合数据于 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-
+            
+            file_path = 'data/AIPEPortfolio_new.xlsx'
+            commit_message = f"chore: Update portfolio data via web UI on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            
             try:
                 contents = repo.get_contents(file_path, ref="main")
                 repo.update_file(
@@ -79,31 +74,27 @@ class handler(BaseHTTPRequestHandler):
                     sha=contents.sha,
                     branch="main"
                 )
-                action = "更新"
+                action = "updated"
             except GithubException as e:
-                if e.status == 404: # 文件不存在
+                if e.status == 404:
                     repo.create_file(
                         path=file_path,
                         message=commit_message,
                         content=excel_content,
                         branch="main"
                     )
-                    action = "创建"
+                    action = "created"
                 else:
-                    raise e # 重新抛出其他 GitHub 异常
-            
-            # 4. 发送成功响应
-            success_message = {
-                "message": f"成功在主分支上{action}了 '{file_path}'。CI/CD 将现在开始处理。"
-            }
-            self._send_response(200, success_message)
+                    raise e
 
-        except json.JSONDecodeError:
-            self._send_response(400, {"error": "请求体不是有效的 JSON 格式"})
+            # Use the centralized header setter for the final response
+            self._set_headers(200)
+            response_body = {"message": f"Successfully {action} '{file_path}' on the main branch. CI/CD will now take over."}
+            self.wfile.write(json.dumps(response_body).encode('utf-8'))
+
+        except (ValueError, KeyError, ConnectionError) as e:
+            self._set_headers(400)
+            self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
         except Exception as e:
-            error_message = {"error": f"发生了意外的服务器错误: {str(e)}"}
-            self._send_response(500, error_message)
-
-    def do_GET(self):
-        """处理不被允许的 GET 请求"""
-        self._send_response(405, {"error": "Method Not Allowed"})
+            self._set_headers(500)
+            self.wfile.write(json.dumps({"error": f"An unexpected server error occurred: {str(e)}"}).encode('utf-8'))
