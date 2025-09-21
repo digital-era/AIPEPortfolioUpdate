@@ -1,0 +1,2 @@
+requests  # <-- 添加这一行
+PyGithub
